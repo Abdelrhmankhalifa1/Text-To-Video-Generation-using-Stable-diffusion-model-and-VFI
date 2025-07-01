@@ -1,0 +1,525 @@
+# Define model and dataset
+model_id = "CompVis/stable-diffusion-v1-4"
+dataset_name = "nancy9/labels-characters"  # replace with your dataset name
+
+# Load the tokenizer and dataset
+tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+dataset = load_dataset(dataset_name)
+
+# Define the image transformation
+image_transform = transforms.Compose([
+    transforms.Resize((256, 256)),  
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
+
+# Preprocess function
+def preprocess(example):
+    prompt = example['caption']
+    image = example['image']
+
+    # Ensure the image is converted to RGB (some images might be grayscale or have alpha channels)
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Apply the transformation
+    image = image_transform(image)
+
+    inputs = tokenizer(prompt, padding="max_length", truncation=True, return_tensors="pt")
+    input_ids = inputs.input_ids.squeeze(0)  # Remove the batch dimension
+    # Return both input_ids and pixel_values as tensors
+    return {"input_ids": input_ids, "pixel_values": image}
+
+# Apply preprocessing
+dataset = dataset.map(preprocess, remove_columns=["caption"])
+half_size = len(dataset["train"]) 
+# Create a Subset for training on half the data
+train_subset = Subset(dataset["train"], range(half_size))  # Use the first half
+# Custom collate function
+def collate_fn(batch):
+    input_ids = [item['input_ids'] for item in batch]
+    pixel_values = [item['pixel_values'] for item in batch]
+
+    # Ensure all items are tensors
+    input_ids = [torch.tensor(item) if not isinstance(item, torch.Tensor) else item for item in input_ids]
+    pixel_values = [torch.tensor(item) if not isinstance(item, torch.Tensor) else item for item in pixel_values]
+
+    # Convert lists to tensors
+    input_ids = torch.stack(input_ids)
+    pixel_values = torch.stack(pixel_values)
+    return {"input_ids": input_ids, "pixel_values": pixel_values}
+    
+
+# Create DataLoader with the subset
+train_dataloader = DataLoader(train_subset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+val_dataloader = DataLoader(dataset['validation'], batch_size=2, shuffle=True, collate_fn=collate_fn)
+test_dataloader = DataLoader(dataset['test'], batch_size=2, shuffle=True, collate_fn=collate_fn)
+
+# Load the pretrained Stable Diffusion model
+text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder")
+vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
+
+# Load the scheduler
+scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+
+# Set device (GPU if available)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+text_encoder.to(device)
+vae.to(device)
+unet.to(device)
+
+# Define a custom forward function to use checkpointing
+def custom_forward(*inputs):
+    return unet(*inputs).sample
+
+# Initialize the scaler
+scaler = GradScaler()
+
+# Define the optimizer (using AdamW)
+optimizer = AdamW(
+    [param for name, param in unet.named_parameters() if "out" in name], lr=1e-5
+)  # Adjust learning rate as needed
+
+# Gradient accumulation steps
+accumulation_steps = 8
+
+# Freeze all layers except the output layers
+for name, param in unet.named_parameters():
+    if "out" not in name:
+        param.requires_grad = False
+
+# Early stopping settings
+patience = 3  # Number of epochs to wait for improvement before stopping
+min_delta = 1e-4  # Minimum change in the monitored metric to qualify as improvement
+best_val_loss = np.inf
+early_stop_counter = 0
+
+# Training settings
+num_epochs = 210 
+save_interval = 5 
+unet.train()
+start_epoch = 0
+
+# Check for existing weights to resume training
+for i in range(num_epochs, 0, -1):
+    if os.path.exists(f"lora_weights/unet_weights_epoch_{i+1}.pth"):
+        start_epoch = i + 1
+        print(f"Loading weights from epoch {start_epoch}")
+        unet.load_state_dict(torch.load(f"lora_weights/unet_weights_epoch_{start_epoch}.pth"))
+        break
+
+# Training loop
+for epoch in range(start_epoch, num_epochs):
+    # Training phase
+    progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}")
+    optimizer.zero_grad()
+    epoch_loss = 0.0
+
+    for i, batch in enumerate(progress_bar):
+        # Move batch to device
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        with autocast():
+            # Forward pass
+            latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, scheduler.num_train_timesteps, (latents.shape[0],), device=device).long()
+            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+            encoder_hidden_states = text_encoder(batch["input_ids"]).last_hidden_state
+
+            # Predict the noise residual using checkpointing
+            noise_pred = checkpoint(custom_forward, noisy_latents, timesteps, encoder_hidden_states)
+
+            # Calculate loss
+            loss = torch.nn.functional.mse_loss(noise_pred, noise)
+
+        scaler.scale(loss).backward()
+
+        # Apply gradients to the optimizer
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+        # Accumulate loss
+        epoch_loss += loss.item()
+
+        # Clear variables and cache
+        del latents, noise, noisy_latents, encoder_hidden_states, noise_pred
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Update progress bar
+        progress_bar.set_postfix(loss=loss.item())
+
+    # Calculate average training loss for the epoch
+    avg_train_loss = epoch_loss / len(train_dataloader)
+    print(f"Epoch {epoch+1}: Average Training Loss: {avg_train_loss:.4f}")
+
+    # Save weights every 'save_interval' epochs
+    if (epoch + 1) % save_interval == 0:
+        os.makedirs("lora_weights", exist_ok=True)
+        save_path = f"lora_weights/unet_weights_epoch_{epoch+1}.pth"
+        torch.save(unet.state_dict(), save_path)
+        print(f"Model weights saved to {save_path}")
+
+    # Validation phase
+    unet.eval()  # Set model to evaluation mode
+    val_loss = 0.0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            with autocast():
+                # Validation steps (similar to training, but no backprop)
+                latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, scheduler.num_train_timesteps, (latents.shape[0],), device=device).long()
+                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+                encoder_hidden_states = text_encoder(batch["input_ids"]).last_hidden_state
+
+                noise_pred = checkpoint(custom_forward, noisy_latents, timesteps, encoder_hidden_states)
+
+                loss = torch.nn.functional.mse_loss(noise_pred, noise)
+                val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_dataloader)
+    print(f"Epoch {epoch+1}: Average Validation Loss: {avg_val_loss:.4f}")
+
+    # Set model back to train mode
+    unet.train()
+
+print("Training complete!")
+
+# Assuming vae, text_encoder, unet, scheduler, tokenizer are already defined and loaded
+unet.load_state_dict(torch.load("lora_weights/unet_weights_epoch_210.pth"))
+# Initialize the feature extractor
+feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
+
+# Set safety_checker to None if you don't need it
+safety_checker = None
+
+# Load the fine-tuned model into the pipeline
+pipeline = StableDiffusionPipeline(
+    vae=vae,
+    text_encoder=text_encoder,
+    unet=unet,
+    scheduler=scheduler,
+    tokenizer=tokenizer, 
+    safety_checker=safety_checker,
+    feature_extractor=feature_extractor
+).to(device)
+
+# Define the prompt
+prompt = " boy and girl "
+
+# Generate the image
+generated_image = pipeline(prompt).images[0]
+generated_image.save("generated_image.png")
+
+
+# Generate Key Frames with Multiple Prompts
+prompts = [
+    "A boy running",
+    "A boy and a girl playing",
+    "a cat next to a girl"
+]
+num_frames_per_prompt = 5
+total_frames = len(prompts) * num_frames_per_prompt
+print("Generating key frames...")
+
+frame_idx = 0
+for prompt in prompts:
+    for i in range(num_frames_per_prompt):
+        frame_prompt = f"{prompt}, frame {i + 1}"
+        with torch.no_grad():
+            image = pipeline(frame_prompt, num_inference_steps=50, height=512, width=512).images[0]
+        frame_path = os.path.join(output_frames_dir, f"frame_{frame_idx:04d}.png")
+        image.save(frame_path)
+        print(f"Saved frame {frame_idx + 1}/{total_frames} at {frame_path}")
+        frame_idx += 1
+        del image
+        torch.cuda.empty_cache()
+
+# Combine frames into a low-FPS video (key frames video)
+key_frames_video = os.path.join(base_dir, "key_frames.mp4")
+print("Creating key frames video...")
+with imageio.get_writer(key_frames_video, fps=5) as writer:
+    for i in range(total_frames):
+        frame_path = os.path.join(output_frames_dir, f"frame_{i:04d}.png")
+        writer.append_data(imageio.imread(frame_path))
+print(f"Key frames video saved at {key_frames_video}")
+
+def interpolate_frames(input_dir, output_dir, exp=4):
+    """
+    Perform interpolation between sequential keyframes and save with ordered naming
+    """
+    print(f"Starting interpolation process...")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {output_dir}")
+
+    # Check if input directory exists
+    if not os.path.exists(input_dir):
+        raise ValueError(f"Input directory '{input_dir}' does not exist!")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get list of frames and sort them
+    frames = glob(os.path.join(input_dir, "frame_*.png"))
+    if not frames:
+        raise ValueError(f"No frames found in {input_dir}! Looking for files matching 'frame_*.png'")
+
+    frames.sort()
+    print(f"Found {len(frames)} frames: {[os.path.basename(f) for f in frames]}")
+
+    # Counter for final frame naming
+    frame_counter = 0
+
+    # Process each pair of consecutive frames
+    for i in range(len(frames) - 1):
+        frame1 = frames[i]
+        frame2 = frames[i + 1]
+
+        print(f"\nProcessing pair {i}: {os.path.basename(frame1)} → {os.path.basename(frame2)}")
+
+        # Create interpolation command
+        cmd = [
+            sys.executable,  # Use the current Python interpreter
+            "inference_img.py",
+            "--img",
+            frame1,
+            frame2,
+            "--exp",
+            str(exp)
+        ]
+
+        # Remove previous output directory if it exists
+        if os.path.exists('output'):
+            print(f"Cleaning up previous output directory")
+            shutil.rmtree('output')
+
+        # Create fresh output directory
+        os.makedirs('output', exist_ok=True)
+
+        # Run interpolation
+        print(f"Running command: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error running inference:")
+                print(f"stdout: {result.stdout}")
+                print(f"stderr: {result.stderr}")
+                raise subprocess.CalledProcessError(result.returncode, cmd)
+        except Exception as e:
+            print(f"Failed to run interpolation: {str(e)}")
+            raise
+
+        # Get all interpolated frames
+        interpolated_frames = sorted(glob(os.path.join("output", "img*.png")))
+        print(f"Generated {len(interpolated_frames)} interpolated frames")
+
+        # Copy and rename each interpolated frame
+        for frame in interpolated_frames:
+            new_name = f"interpolated_{frame_counter:06d}.png"
+            new_path = os.path.join(output_dir, new_name)
+            shutil.copy2(frame, new_path)
+            print(f"Saved {os.path.basename(frame)} as {new_name}")
+            frame_counter += 1
+
+        # Clean up output directory
+        shutil.rmtree('output')
+
+    print(f"\nInterpolation complete! Generated {frame_counter} total frames")
+    return frame_counter
+
+if __name__ == "__main__":
+    # Directory containing your keyframes
+    input_directory = "/content/frames"  # Change this to your input directory
+
+    # Directory where interpolated frames will be saved
+    output_directory = "/content/interpolated_frames"
+
+    # Number of intermediate frames to generate (2^exp - 1 frames between each pair)
+    exp = 4  # This will generate 15 frames between each pair
+
+    try:
+        total_frames = interpolate_frames(input_directory, output_directory, exp)
+        print(f"Successfully created {total_frames} interpolated frames in: {output_directory}")
+    except Exception as e:
+        print(f"Error during interpolation: {str(e)}")
+
+  # Get all interpolated frames
+        interpolated_frames = sorted(glob(os.path.join("output", "img*.png")))
+        print(f"Generated {len(interpolated_frames)} interpolated frames")
+
+        # Copy and rename each interpolated frame
+        for frame in interpolated_frames:
+            new_name = f"interpolated_{frame_counter:06d}.png"
+            new_path = os.path.join(output_dir, new_name)
+            shutil.copy2(frame, new_path)
+            print(f"Saved {os.path.basename(frame)} as {new_name}")
+            frame_counter += 1
+
+        # Clean up output directory
+        shutil.rmtree('output')
+
+    print(f"\nInterpolation complete! Generated {frame_counter} total frames")
+    return frame_counter
+
+if __name__ == "__main__":
+    # Directory containing your keyframes
+    input_directory = "/content/frames"  # Change this to your input directory
+
+    # Directory where interpolated frames will be saved
+    output_directory = "/content/interpolated_frames"
+
+    # Number of intermediate frames to generate (2^exp - 1 frames between each pair)
+    exp = 4  # This will generate 15 frames between each pair
+
+    try:
+        total_frames = interpolate_frames(input_directory, output_directory, exp)
+        print(f"Successfully created {total_frames} interpolated frames in: {output_directory}")
+    except Exception as e:
+        print(f"Error during interpolation: {str(e)}")
+
+!ffmpeg -r 15 -i /content/interpolated_frames/interpolated_%06d.png -c:v libx264 -pix_fmt yuv420p interpolated_video2.mp4
+
+!python3 inference_video.py --multi=4 --video=/content/key_frames.mp4
+
+def create_video_from_frames(frames_dir, output_path, fps=30):
+    """
+    Create a video from a directory of frames
+    Args:
+        frames_dir: Directory containing the frames
+        output_path: Path where the video will be saved
+        fps: Frames per second for the output video
+    """
+    print(f"Creating video from frames in {frames_dir}")
+
+    # Get all frames
+    frames = glob(os.path.join(frames_dir, "*.png"))
+    if not frames:
+        raise ValueError(f"No frames found in {frames_dir}")
+
+    frames.sort()  # Ensure frames are in order
+    print(f"Found {len(frames)} frames")
+
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(frames[0])
+    height, width, layers = first_frame.shape
+
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID' for AVI
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # Write frames to video
+    for i, frame_path in enumerate(frames):
+        if i % 100 == 0:  # Progress update every 100 frames
+            print(f"Processing frame {i+1}/{len(frames)}")
+
+        frame = cv2.imread(frame_path)
+        out.write(frame)
+
+    # Release everything when done
+    out.release()
+    print(f"Video saved to {output_path}")
+    print(f"Video duration: {len(frames)/fps:.2f} seconds")
+
+if __name__ == "__main__":
+    # Directory containing all frames (interpolated and original)
+    frames_directory = "/content/interpolated_frames"
+
+    # Output video path
+    output_video = "output_video.mp4"
+
+    # Frames per second (adjust this to control video speed)
+    fps = 30
+
+    try:
+        create_video_from_frames(frames_directory, output_video, fps)
+    except Exception as e:
+        print(f"Error creating video: {str(e)}")
+
+import os
+from transformers import pipeline
+
+# Convert Text to Speech using gTTS
+def text_to_speech(narrative, save_path):
+    tts = gTTS(narrative, lang='en')
+
+    # Save the audio to the specified path
+    os.makedirs(save_path, exist_ok=True)  # Ensure the directory exists
+    audio_file_path = os.path.join(save_path, "narrative_audio.mp3")
+    tts.save(audio_file_path)
+
+    return audio_file_path
+
+def generate_story(image_descriptions, prompt_template, max_length=300):
+    """
+    Generates a story from a list of image descriptions using a language model.
+
+    Args:
+        image_descriptions (list): List of descriptions for each image.
+        prompt_template (str): Template for generating the story.
+        max_length (int): Maximum length of the story in tokens.
+
+    Returns:
+        str: Generated story (excluding the prompt).
+    """
+    # Load a pre-trained language generation pipeline
+    story_generator = pipeline("text-generation", model="gpt2")  # Using GPT-2 for simplicity
+
+    # Combine image descriptions into the narrative prompt
+    combined_descriptions = "\n".join(f"{desc}" for i, desc in enumerate(image_descriptions))
+    prompt = prompt_template.format(descriptions=combined_descriptions)
+
+    # Generate the story
+    output = story_generator(prompt, max_length=max_length, do_sample=True, temperature=0.8)
+
+    # Extract only the generated story part (removing the prompt text)
+    generated_story = output[0]['generated_text'].replace(prompt, "").strip()
+    return generated_story
+
+# Example Image Descriptions
+image_descriptions = prompts
+
+# Example Prompt Template
+prompt_template = """
+Using the following descriptions of scenes, create a story:
+{descriptions}
+
+Write a story that flows naturally, connects all the scenes
+"""
+
+# Generate the Story
+story = generate_story(image_descriptions, prompt_template)
+print("Generated Story:\n", story)
+
+# Save the story to a text file
+save_path = "/content/story.txt"
+with open(save_path, "w") as file:
+    file.write(story)
+
+print(f"Story saved to {save_path}")
+# Set the save path
+save_path = "/content/audio"  # Path where you want to save the image, audio, and video
+
+# Convert the Story to Speech (Audio)
+audio_path = text_to_speech(story, save_path)
+print(f"Audio saved to {audio_path}")
+
+# Play the audio in Colab
+Audio(audio_path)
+
+!ffmpeg -i /content/key_frames_2X_10fps.mp4 -i /content/narrative_audio.mp3 -c:v copy -c:a aac -strict experimental output_video_with_audio.mp4
+
+
+
+
